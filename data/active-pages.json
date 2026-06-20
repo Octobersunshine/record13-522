@@ -1,0 +1,37 @@
+[
+  {
+    "id": "page_1",
+    "route": "/",
+    "name": "首页",
+    "enabled": true,
+    "useHash": true,
+    "createdAt": "2026-06-20T19:16:24.525Z"
+  },
+  {
+    "id": "page_2",
+    "route": "/about",
+    "name": "关于我们",
+    "enabled": true,
+    "useHash": true,
+    "createdAt": "2026-06-20T19:16:24.527Z"
+  },
+  {
+    "id": "page_3",
+    "route": "/products",
+    "name": "产品列表",
+    "enabled": false,
+    "useHash": true,
+    "createdAt": "2026-06-20T19:16:24.527Z",
+    "updatedAt": "2026-06-20T19:26:49.800Z"
+  },
+  {
+    "id": "page_1781983609778_ywvc4x",
+    "route": "/blog",
+    "name": "????",
+    "enabled": true,
+    "useHash": true,
+    "removeScripts": false,
+    "createdAt": "2026-06-20T19:26:49.778Z",
+    "updatedAt": "2026-06-20T19:26:49.779Z"
+  }
+]

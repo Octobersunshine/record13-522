@@ -1,10 +1,12 @@
 const express = require('express');
 const path = require('path');
 const PrerenderService = require('./prerender');
+const ScheduledPrerenderService = require('./scheduler');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SPA_BASE_URL = process.env.SPA_BASE_URL || `http://localhost:${PORT}`;
+const STATIC_SPA_URL = `${SPA_BASE_URL}/static/index.html`;
 
 const MAX_QUEUE_BEFORE_REJECT = process.env.MAX_QUEUE_BEFORE_REJECT
   ? parseInt(process.env.MAX_QUEUE_BEFORE_REJECT, 10)
@@ -30,6 +32,17 @@ const prerenderService = new PrerenderService({
     ? parseInt(process.env.MEMORY_THRESHOLD_MB, 10)
     : 2048
 });
+
+const scheduledService = new ScheduledPrerenderService(prerenderService, {
+  spaBaseUrl: STATIC_SPA_URL,
+  cronExpression: process.env.CRON_SCHEDULE || '0 0 2 * * *',
+  timezone: process.env.CRON_TIMEZONE || 'Asia/Shanghai',
+  concurrency: process.env.CRON_CONCURRENCY
+    ? parseInt(process.env.CRON_CONCURRENCY, 10)
+    : 2
+});
+
+const pagesManager = scheduledService.getActivePagesManager();
 
 function overloadProtection(req, res, next) {
   const status = prerenderService.getQueueStatus();
@@ -97,11 +110,40 @@ prerenderService.on('browser-disconnected', () => {
   console.warn('[浏览器断开] Puppeteer 浏览器实例意外断开，将在下次请求时自动重建');
 });
 
+scheduledService.on('scheduler:started', ({ cronExpression, timezone, nextRuns }) => {
+  console.log(`[定时调度] 已启动，Cron: ${cronExpression}，时区: ${timezone}`);
+});
+
+scheduledService.on('scheduler:stopped', () => {
+  console.log('[定时调度] 已停止');
+});
+
+scheduledService.on('scheduler:error', ({ error }) => {
+  console.error('[定时调度] 错误:', error);
+});
+
+scheduledService.on('job:start', ({ type, totalPages, jobId }) => {
+  console.log(`[定时任务] 开始 - 类型:${type} 页面数:${totalPages} ID:${jobId}`);
+});
+
+scheduledService.on('job:progress', ({ jobId, total, completed, failed, progress }) => {
+  console.log(`[定时任务] 进度 - ${jobId}: ${progress}% (${completed}/${total} 失败:${failed})`);
+});
+
+scheduledService.on('job:complete', ({ jobId, total, completed, failed, durationMs }) => {
+  console.log(`[定时任务] 完成 - ${jobId}: ${completed}/${total} 成功 失败:${failed} 耗时:${durationMs}ms`);
+});
+
+scheduledService.on('job:error', ({ jobId, error }) => {
+  console.error(`[定时任务] 失败 - ${jobId}: ${error}`);
+});
+
 app.use('/static', express.static(path.join(__dirname, 'public')));
 app.use('/prerendered', express.static(prerenderService.getOutputDir()));
 
 app.get('/health', (req, res) => {
   const status = prerenderService.getQueueStatus();
+  const schedStatus = scheduledService.getStatus();
   const healthy = !status.queue.isOverloaded && !status.memory.isHigh;
   res.status(healthy ? 200 : 503).json({
     status: healthy ? 'ok' : 'degraded',
@@ -110,16 +152,193 @@ app.get('/health', (req, res) => {
     healthy,
     checks: {
       memoryOk: !status.memory.isHigh,
-      queueOk: !status.queue.isOverloaded
+      queueOk: !status.queue.isOverloaded,
+      schedulerOk: schedStatus.enabled,
+      schedulerRunning: !schedStatus.isRunning
     }
   });
 });
 
 app.get('/api/status', (req, res) => {
-  const status = prerenderService.getQueueStatus();
+  const prStatus = prerenderService.getQueueStatus();
+  const schedStatus = scheduledService.getStatus();
+  res.json({
+    success: true,
+    data: {
+      prerender: prStatus,
+      scheduler: schedStatus
+    }
+  });
+});
+
+app.get('/api/scheduler/status', (req, res) => {
+  const status = scheduledService.getStatus();
   res.json({
     success: true,
     data: status
+  });
+});
+
+app.post('/api/scheduler/run', async (req, res) => {
+  const { force } = req.body;
+  const result = await scheduledService.triggerManualRun(force === true);
+  res.json({
+    success: result.success,
+    requestId: req.requestId,
+    data: result.success ? {
+      jobId: result.jobId,
+      total: result.total,
+      completed: result.completed,
+      failed: result.failed,
+      durationMs: result.durationMs,
+      allSucceeded: result.allSucceeded
+    } : null,
+    error: result.error || null
+  });
+});
+
+app.get('/api/scheduler/history', (req, res) => {
+  const limit = parseInt(req.query.limit, 10) || 50;
+  const history = scheduledService.getHistory(limit);
+  res.json({
+    success: true,
+    data: {
+      total: history.length,
+      items: history
+    }
+  });
+});
+
+app.post('/api/scheduler/stop', (req, res) => {
+  const stopped = scheduledService.stop();
+  res.json({
+    success: true,
+    data: {
+      stopped,
+      message: stopped ? '定时任务调度已停止' : '调度器未运行'
+    }
+  });
+});
+
+app.post('/api/scheduler/start', (req, res) => {
+  const started = scheduledService.start();
+  res.json({
+    success: true,
+    data: {
+      started,
+      nextRuns: started ? scheduledService.getNextRunTimes(3) : null,
+      message: started ? '定时任务调度已启动' : '调度器已在运行或被禁用'
+    }
+  });
+});
+
+app.get('/api/pages', (req, res) => {
+  const { enabledOnly } = req.query;
+  const pages = pagesManager.getAllPages(enabledOnly === 'true');
+  res.json({
+    success: true,
+    data: {
+      total: pages.length,
+      items: pages
+    }
+  });
+});
+
+app.get('/api/pages/:id', (req, res) => {
+  const page = pagesManager.getPageById(req.params.id);
+  if (!page) {
+    return res.status(404).json({
+      success: false,
+      error: '页面不存在',
+      code: 'NOT_FOUND'
+    });
+  }
+  res.json({
+    success: true,
+    data: page
+  });
+});
+
+app.post('/api/pages', (req, res) => {
+  const { route, name, enabled, useHash, removeScripts } = req.body;
+
+  if (!route) {
+    return res.status(400).json({
+      success: false,
+      error: '缺少必需参数: route',
+      code: 'MISSING_PARAM'
+    });
+  }
+
+  const newPage = pagesManager.addPage({
+    route,
+    name,
+    enabled,
+    useHash,
+    removeScripts
+  });
+
+  res.status(201).json({
+    success: true,
+    data: newPage
+  });
+});
+
+app.put('/api/pages/:id', (req, res) => {
+  const { name, route, enabled, useHash, removeScripts } = req.body;
+
+  const updated = pagesManager.updatePage(req.params.id, {
+    name,
+    route,
+    enabled,
+    useHash,
+    removeScripts
+  });
+
+  if (!updated) {
+    return res.status(404).json({
+      success: false,
+      error: '页面不存在',
+      code: 'NOT_FOUND'
+    });
+  }
+
+  res.json({
+    success: true,
+    data: updated
+  });
+});
+
+app.delete('/api/pages/:id', (req, res) => {
+  const deleted = pagesManager.deletePage(req.params.id);
+  if (!deleted) {
+    return res.status(404).json({
+      success: false,
+      error: '页面不存在',
+      code: 'NOT_FOUND'
+    });
+  }
+  res.json({
+    success: true,
+    data: {
+      message: '页面已删除'
+    }
+  });
+});
+
+app.patch('/api/pages/:id/toggle', (req, res) => {
+  const { enabled } = req.body;
+  const updated = pagesManager.togglePage(req.params.id, enabled === true);
+  if (!updated) {
+    return res.status(404).json({
+      success: false,
+      error: '页面不存在',
+      code: 'NOT_FOUND'
+    });
+  }
+  res.json({
+    success: true,
+    data: updated
   });
 });
 
@@ -342,10 +561,12 @@ app.get('/api/prerender/view', overloadProtection, async (req, res) => {
 
 app.get('/', (req, res) => {
   const qs = prerenderService.getQueueStatus();
+  const ss = scheduledService.getStatus();
+  const activePages = pagesManager.getActiveRoutes();
   res.json({
     name: 'SPA 预渲染服务',
-    version: '1.1.0',
-    description: '带并发控制和资源保护的 SPA 预渲染服务',
+    version: '1.2.0',
+    description: '带并发控制、资源保护和定时任务的 SPA 预渲染服务',
     features: [
       '信号量并发控制（限制最大渲染任务数）',
       'Page Pool 页面池复用（减少 Chromium 进程开销）',
@@ -353,18 +574,82 @@ app.get('/', (req, res) => {
       '内存监控 + 自动清理（防止 OOM）',
       '过载保护中间件（队列/内存超限返回 503）',
       '批量任务并发度可配置',
+      '每日定时预渲染（默认凌晨 2:00 执行）',
+      '活动页面管理（增删改查、启用/禁用）',
+      '任务执行历史记录和状态监控',
       '请求追踪 ID + 全链路事件日志'
     ],
     endpoints: {
       status: {
         method: 'GET',
         path: '/api/status',
-        description: '查看服务状态、队列情况、内存使用、并发统计'
+        description: '查看服务状态（含调度器状态）'
       },
       health: {
         method: 'GET',
         path: '/health',
-        description: '健康检查，返回 200 或 503'
+        description: '健康检查'
+      },
+      schedulerStatus: {
+        method: 'GET',
+        path: '/api/scheduler/status',
+        description: '定时任务状态（下次执行时间、当前运行状态）'
+      },
+      schedulerRun: {
+        method: 'POST',
+        path: '/api/scheduler/run',
+        description: '立即手动触发一次预渲染（force=true 可强制执行）',
+        body: { force: '可选 - 强制执行，即使有任务在运行' }
+      },
+      schedulerHistory: {
+        method: 'GET',
+        path: '/api/scheduler/history',
+        description: '获取定时任务执行历史记录',
+        params: { limit: '可选 - 返回记录数，默认 50' }
+      },
+      schedulerStart: {
+        method: 'POST',
+        path: '/api/scheduler/start',
+        description: '启动定时任务调度器'
+      },
+      schedulerStop: {
+        method: 'POST',
+        path: '/api/scheduler/stop',
+        description: '停止定时任务调度器'
+      },
+      pagesList: {
+        method: 'GET',
+        path: '/api/pages',
+        description: '活动页面列表',
+        params: { enabledOnly: '可选 - true 只返回启用的页面' }
+      },
+      pagesCreate: {
+        method: 'POST',
+        path: '/api/pages',
+        description: '新增活动页面',
+        body: {
+          route: '页面路由路径（必填）',
+          name: '页面名称',
+          enabled: '是否启用（默认 true）',
+          useHash: '是否 Hash 路由（默认 true）',
+          removeScripts: '是否移除 script 标签'
+        }
+      },
+      pagesUpdate: {
+        method: 'PUT',
+        path: '/api/pages/:id',
+        description: '更新活动页面'
+      },
+      pagesDelete: {
+        method: 'DELETE',
+        path: '/api/pages/:id',
+        description: '删除活动页面'
+      },
+      pagesToggle: {
+        method: 'PATCH',
+        path: '/api/pages/:id/toggle',
+        description: '切换页面启用/禁用状态',
+        body: { enabled: 'true|false' }
       },
       renderSingle: {
         method: 'GET',
@@ -387,8 +672,8 @@ app.get('/', (req, res) => {
           route: '单条路由（与 routes 二选一）',
           baseUrl: 'SPA 基础 URL',
           useHash: '是否 hash 路由',
-          concurrency: '批量并发度（默认 = 全局最大并发）',
-          stopOnError: '遇到错误是否中断批量任务 (true|false)',
+          concurrency: '批量并发度',
+          stopOnError: '遇错是否中断',
           removeScripts: '移除 script 标签'
         }
       },
@@ -396,16 +681,6 @@ app.get('/', (req, res) => {
         method: 'GET',
         path: '/api/prerender/view',
         description: '直接返回渲染后的 HTML 响应'
-      },
-      prerenderedFiles: {
-        method: 'GET',
-        path: '/prerendered/*',
-        description: '访问已生成的静态 HTML 文件'
-      },
-      spaDemo: {
-        method: 'GET',
-        path: '/static/index.html',
-        description: '内置示例 SPA（Hash 路由）'
       }
     },
     currentStatus: {
@@ -413,30 +688,42 @@ app.get('/', (req, res) => {
       queue: `${qs.semaphore.waiting} 任务排队中`,
       memory: `${qs.memory.heapUsedMB}MB / ${qs.memory.thresholdMB}MB`,
       completed: `${qs.stats.totalCompleted} 个任务已完成`,
-      avgTime: `${qs.stats.avgTimeMs}ms 平均耗时`
+      avgTime: `${qs.stats.avgTimeMs}ms 平均耗时`,
+      scheduler: ss.enabled ? '已启用' : '已禁用',
+      nextScheduledRun: ss.enabled && ss.nextRunTimes && ss.nextRunTimes[0]
+        ? ss.nextRunTimes[0].toLocaleString('zh-CN', { timeZone: ss.timezone })
+        : null,
+      activePagesCount: activePages.length
     },
     examples: [
       '状态监控: GET /api/status',
-      '单页渲染: GET /api/prerender?route=/&useHash=true&baseUrl=http://localhost:3000/static/index.html',
-      `批量渲染 (并发度=2): POST /api/prerender  BODY: {"routes":["/","/about","/products","/contact"],"useHash":true,"concurrency":2}`,
-      '查看渲染结果: GET /api/prerender/view?route=/products&useHash=true&baseUrl=http://localhost:3000/static/index.html',
-      '访问静态HTML: GET /prerendered/products.html'
+      '调度状态: GET /api/scheduler/status',
+      '立即执行: POST /api/scheduler/run',
+      '页面列表: GET /api/pages',
+      '新增页面: POST /api/pages  BODY: {"route":"/new-page","name":"新页面","useHash":true}',
+      '手动单页: GET /api/prerender?route=/&useHash=true&baseUrl=http://localhost:3000/static/index.html',
+      '批量渲染: POST /api/prerender  BODY: {"routes":["/","/about","/products"],"useHash":true,"concurrency":2}'
     ],
     envConfig: {
       PORT: `默认 3000，当前: ${PORT}`,
-      MAX_CONCURRENCY: `默认 = CPU核心数-1，上限 4，当前配置值: ${process.env.MAX_CONCURRENCY || '(默认)'}`,
-      MAX_QUEUE_SIZE: `默认 100，当前配置值: ${process.env.MAX_QUEUE_SIZE || '(默认)'}`,
-      MEMORY_THRESHOLD_MB: `默认 2048，当前配置值: ${process.env.MEMORY_THRESHOLD_MB || '(默认)'}`
+      MAX_CONCURRENCY: `默认 = CPU核心数-1，上限 4，当前: ${process.env.MAX_CONCURRENCY || '(默认)'}`,
+      CRON_SCHEDULE: `默认 "0 0 2 * * *" (每天凌晨2点)，当前: ${process.env.CRON_SCHEDULE || '(默认)'}`,
+      CRON_TIMEZONE: `默认 "Asia/Shanghai"，当前: ${process.env.CRON_TIMEZONE || '(默认)'}`,
+      CRON_ENABLED: `默认 true，当前: ${process.env.CRON_ENABLED !== 'false' ? 'true' : 'false'}`,
+      CRON_CONCURRENCY: `定时任务并发度，默认 2，当前: ${process.env.CRON_CONCURRENCY || '(默认)'}`,
+      MEMORY_THRESHOLD_MB: `默认 2048，当前: ${process.env.MEMORY_THRESHOLD_MB || '(默认)'}`
     }
   });
 });
 
 const server = app.listen(PORT, () => {
   const qs = prerenderService.getQueueStatus();
+  const ss = scheduledService.getStatus();
   console.log('========================================');
   console.log('  SPA 预渲染服务已启动');
   console.log(`  服务地址:   http://localhost:${PORT}`);
   console.log(`  状态监控:   http://localhost:${PORT}/api/status`);
+  console.log(`  调度状态:   http://localhost:${PORT}/api/scheduler/status`);
   console.log(`  健康检查:   http://localhost:${PORT}/health`);
   console.log(`  示例 SPA:   http://localhost:${PORT}/static/index.html`);
   console.log('----------------------------------------');
@@ -444,19 +731,35 @@ const server = app.listen(PORT, () => {
   console.log(`  最大页面:   ${prerenderService.maxPagesPerBrowser} 个页面实例`);
   console.log(`  队列上限:   ${qs.queue.maxSize} 个任务`);
   console.log(`  内存阈值:   ${qs.memory.thresholdMB} MB`);
+  console.log('----------------------------------------');
+  if (ss.enabled) {
+    console.log(`  定时任务:   已启用`);
+    console.log(`  Cron 表达式: ${ss.cronExpression}`);
+    console.log(`  时区:       ${ss.timezone}`);
+    if (ss.nextRunTimes && ss.nextRunTimes.length > 0) {
+      console.log(`  下次执行:   ${ss.nextRunTimes[0].toLocaleString('zh-CN', { timeZone: ss.timezone })}`);
+    }
+    console.log(`  活动页面:   ${ss.activePagesCount} 个`);
+  } else {
+    console.log(`  定时任务:   已禁用 (CRON_ENABLED=false)`);
+  }
   console.log('========================================');
   console.log('');
-  console.log('调用示例:');
-  console.log(`  # 单页渲染`);
-  console.log(`  curl "http://localhost:${PORT}/api/prerender?route=/&useHash=true&baseUrl=http://localhost:${PORT}/static/index.html"`);
+  console.log('API 使用示例:');
+  console.log(`  # 手动触发一次预渲染`);
+  console.log(`  curl -X POST "http://localhost:${PORT}/api/scheduler/run"`);
   console.log('');
-  console.log(`  # 查看状态（并发/队列/内存）`);
-  console.log(`  curl "http://localhost:${PORT}/api/status"`);
+  console.log(`  # 查看定时任务执行历史`);
+  console.log(`  curl "http://localhost:${PORT}/api/scheduler/history?limit=10"`);
+  console.log('');
+  console.log(`  # 管理活动页面`);
+  console.log(`  curl "http://localhost:${PORT}/api/pages"`);
   console.log('');
 });
 
 process.on('SIGINT', async () => {
   console.log('\n正在关闭服务...');
+  scheduledService.destroy();
   await prerenderService.closeBrowser();
   server.close(() => {
     console.log('服务已关闭');
@@ -466,6 +769,7 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
   console.log('\n正在关闭服务...');
+  scheduledService.destroy();
   await prerenderService.closeBrowser();
   server.close(() => {
     console.log('服务已关闭');

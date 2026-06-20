@@ -1,7 +1,7 @@
 {
   "name": "spa-prerender-service",
-  "version": "1.0.0",
-  "description": "Node.js 基础 HTTP 接口，传入页面路由发起单页面预渲染生成静态 HTML",
+  "version": "1.2.0",
+  "description": "Node.js SPA 预渲染服务 - 支持 HTTP 接口、并发控制、定时每日批量预渲染",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,12 +11,15 @@
     "spa",
     "prerender",
     "ssr",
-    "puppeteer"
+    "puppeteer",
+    "cron",
+    "seo"
   ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
+    "node-cron": "^4.4.1",
     "puppeteer": "^22.15.0"
   }
 }
